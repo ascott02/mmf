@@ -74,7 +74,7 @@ class BUTD(Pythia):
                 (batch_size, 1), self.vocab.SOS_INDEX, dtype=torch.long
             )
             timesteps = self.text_processor.max_length
-            sample_list.add_field("targets", sample_list.answers[:, 0, 1:])
+            # sample_list.add_field("targets", sample_list.answers[:, 0, 1:])
         return data, sample_list, timesteps
 
     def init_hidden_state(self, features):
