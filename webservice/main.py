@@ -147,15 +147,20 @@ class PythiaDemo:
 
   def predict(self, url):
     with torch.no_grad():
-      detectron_features = self.get_detectron_features(url)
+      detectron_features_list = self.get_detectron_features(url)
 
-      sample = Sample()
-      sample.dataset_name = "coco"
-      sample.dataset_type = "test"
-      sample.image_feature_0 = detectron_features
-      sample.answers = torch.zeros((1,1), dtype=torch.long)
+      sample_list = [] 
 
-      sample_list = SampleList([sample])
+      for i, detectron_features in enumerate(detectron_features_list):
+          sample = Sample()
+          sample.dataset_name = "coco"
+          sample.dataset_type = "test"
+          sample.image_feature_0 = detectron_features
+          sample.answers = torch.zeros((1,1), dtype=torch.long)
+          sample_list.append(sample)
+
+      # sample_list = SampleList([sample])
+      sample_list = SampleList(sample_list)
       sample_list = sample_list.to("cuda")
       tokens = self.pythia_model(sample_list)["captions"]
 
@@ -188,7 +193,12 @@ class PythiaDemo:
           except:
               stream = BytesIO(path.content) 
               img = Image.open(stream).convert('RGB')
+
+      elif type(image_path) == type(str()) and image_path.startswith('/'):
+          img = Image.open(image_path).convert('RGB')
       else:
+          # print("DEBUG type(image_path):", type(image_path))
+          # print("DEBUG image_path:", image_path[:20])
           stream = BytesIO(image_path) 
           img = Image.open(stream).convert('RGB')
 
@@ -196,11 +206,14 @@ class PythiaDemo:
 
   def _image_transform(self, image_path):
       img = self.get_actual_image(image_path)
+      # img = Image.open(image_path)
 
       im = np.array(img).astype(np.float32)
       im = im[:, :, ::-1]
       im -= np.array([102.9801, 115.9465, 122.7717])
       im_shape = im.shape
+      im_height = im_shape[0]
+      im_width = im_shape[1]
       im_size_min = np.min(im_shape[0:2])
       im_size_max = np.max(im_shape[0:2])
       im_scale = float(800) / float(im_size_min)
@@ -216,7 +229,8 @@ class PythiaDemo:
            interpolation=cv2.INTER_LINEAR
        )
       img = torch.from_numpy(im).permute(2, 0, 1)
-      return img, im_scale
+      im_info = {"width": im_width, "height": im_height}
+      return img, im_scale, im_info
 
 
   def _process_feature_extraction(self, output,
@@ -256,18 +270,54 @@ class PythiaDemo:
       y = x1 / x1_sum
       return y
 
-  def get_detectron_features(self, image_path):
-      im, im_scale = self._image_transform(image_path)
-      img_tensor, im_scales = [im], [im_scale]
+  def get_detectron_features(self, image_paths):
+      img_tensor, im_scales, im_infos = [], [], []
+
+      for image_path in image_paths:
+          im, im_scale, im_info = self._image_transform(image_path)
+          img_tensor.append(im)
+          im_scales.append(im_scale)
+          im_infos.append(im_info)
+       
       current_img_list = to_image_list(img_tensor, size_divisible=32)
       current_img_list = current_img_list.to('cuda')
       with torch.no_grad():
           output = self.detection_model(current_img_list)
+
       feat_list = self._process_feature_extraction(output, im_scales,
                                                   'fc6', 0.2)
-      return feat_list[0]
+      # return feat_list[0]
+      return feat_list
+
 
 demo = PythiaDemo()
+
+
+
+def get_caption(image_batch):
+
+    for i,image in enumerate(image_batch):
+        if uri_validator(image):
+            try:
+                response = requests.get(image, stream=True)
+            except Exception as e:
+                print(f"Exception occurred retrieving image {image}: {str(e)}")
+                continue
+            if response.statuscode == 200:
+                # set decod content value to True, otherwise the downloaded image file's size will be zero
+                response.raw.decode_content = True
+                image_batch[i] = response.raw
+            else:
+                print(f"Image {image} could not be retrieved. Status code {response.status_code} returned.")
+                continue
+    
+    tokens = [demo.predict(image_batch)]
+    captions = []
+    for token in tokens:
+       captions.append(demo.caption_processor(token.tolist()[0])['caption'])
+
+    return captions
+
 
 
 class index:
@@ -288,8 +338,10 @@ Image: <input type="file" name="img_file" /><br/><br/>
         x = web.input(img_file={})
         web.debug(x['img_file'].filename)    # This is the filename
 
-        tokens = demo.predict(x['img_file'].value)
-        caption = demo.caption_processor(tokens.tolist()[0])['caption']
+        caption = get_caption([x['img_file'].value])
+
+        # tokens = demo.predict(x['img_file'].value)
+        # caption = demo.caption_processor(tokens.tolist()[0])['caption']
 
         data_uri = base64.b64encode(x['img_file'].value)
         img_tag = '<img src="data:image/jpeg;base64,{0}">'.format(data_uri.decode())
@@ -304,7 +356,7 @@ This form takes an image upload and caption and returns an IICR rating.<br/><br/
 Image: <input type="file" name="img_file" /><br/><br/>
 <br/><br/>
 <input type="submit" />
-</form>""" + img_tag + """<br/>Caption: """ + caption + """<br/>
+</form>""" + img_tag + """<br/>Caption: """ + caption[0] + """<br/>
 </body></html>"""
 
         if web.ctx.env.get('HTTP_AUTHORIZATION') is not None:
@@ -318,11 +370,7 @@ class api:
     def POST(self, *args):
         x = web.input(img_file={})
         web.debug(x['token'])                  # This is the api token 
-        web.debug(x['caption'])                # This is the caption contents
         web.debug(x['img_url'])                # This is the URL to the image
-
-        if not x['caption']:
-            return "No caption."
 
         if not x['img_url']:
             return "No file."
@@ -333,11 +381,12 @@ class api:
         if not x['token'] in config.tokens:
             return "Not in tokens."
     
+
         ip = web.ctx.ip
         now = datetime.datetime.now()
-        log.info(f"{now} {ip} /api token: {x['token']}, caption: {x['caption']}, img_url: {x['img_url']}")
-        rating = get_ratings([x['img_url']], [str(x['caption'])])
-        return rating
+        log.info(f"{now} {ip} /api token: {x['token']}, img_url: {x['img_url']}")
+        caption = get_caption([x['img_url']])
+        return caption
 
 
 class batch:
@@ -360,8 +409,14 @@ class batch:
         now = datetime.datetime.now()
         log.info(f"{now} {ip} /batch token: {x['token']}, json_payload: {x['json_payload']}")
         json_dict = json.loads(x['json_payload'])
-        ratings = get_ratings(json_dict['images'], json_dict['captions'])
-        return ratings
+        captions = {}
+        for image in json_dict['images']:
+            # caption = get_caption(json_dict['images'])
+            captions[image] = get_caption([image])
+        # return [x['caption'] for x in captions]
+        return json.dumps(captions)
+        # captions = get_caption(json_dict['images'])
+        # return captions
 
 
 class upload:
@@ -369,12 +424,7 @@ class upload:
     def POST(self, *args):
         x = web.input(img_file={})
         web.debug(x['token'])                  # This is the api token 
-        web.debug(x['caption'])                # This is the caption contents
         # web.debug(x['img_data'].filename)      # This is the filename
-
-        if not x['caption']:
-            return "No caption."
-        caption = x['caption'].decode()
 
         if not x['img_data']:
             return "No file."
@@ -388,10 +438,9 @@ class upload:
     
         ip = web.ctx.ip
         now = datetime.datetime.now()
-        log.info(f"{now} {ip} /upload token: {token}, caption:, {caption}")
-        stream = io.BytesIO(x['img_data'])
-        rating = get_ratings([stream], [caption])
-        return rating
+        log.info(f"{now} {ip} /upload token: {token}")
+        caption = get_caption([x['img_data']])
+        return caption
 
 
 class login:
